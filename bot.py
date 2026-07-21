@@ -41,16 +41,27 @@ session = AiohttpSession(timeout=60)
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
 
+# Храним conversation_id для каждого чата — так Dify помнит контекст диалога.
+# Простое хранилище в памяти процесса: сбрасывается при перезапуске сервиса,
+# этого достаточно для обычной работы бота.
+conversation_ids: dict[int, str] = {}
+
 
 def ask_dify(user_text: str, chat_id: int) -> str:
-    payload = json.dumps(
-        {
-            "inputs": {},
-            "query": user_text,
-            "response_mode": "blocking",
-            "user": f"telegram-{chat_id}",
-        }
-    ).encode("utf-8")
+    """Отправляет сообщение в Dify. Передаёт сохранённый conversation_id,
+    чтобы Dify помнил контекст диалога с этим пользователем."""
+    payload_dict = {
+        "inputs": {},
+        "query": user_text,
+        "response_mode": "blocking",
+        "user": f"telegram-{chat_id}",
+    }
+
+    existing_conversation_id = conversation_ids.get(chat_id)
+    if existing_conversation_id:
+        payload_dict["conversation_id"] = existing_conversation_id
+
+    payload = json.dumps(payload_dict).encode("utf-8")
 
     req = urllib.request.Request(
         DIFY_CHAT_URL,
@@ -64,6 +75,11 @@ def ask_dify(user_text: str, chat_id: int) -> str:
     try:
         with urllib.request.urlopen(req, timeout=40) as response:
             result = json.loads(response.read().decode("utf-8"))
+
+        new_conversation_id = result.get("conversation_id")
+        if new_conversation_id:
+            conversation_ids[chat_id] = new_conversation_id
+
         return result.get("answer", "Пустой ответ от Dify.")
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -110,9 +126,17 @@ def transcribe_audio(file_bytes: bytes, filename: str) -> str:
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    conversation_ids.pop(message.chat.id, None)
     await message.answer(
-        "Привет! Я на связи, работаю быстро и понимаю текст и голосовые."
+        "Привет! Я на связи, работаю быстро и понимаю текст и голосовые. "
+        "Помню контекст нашего разговора — если захочешь начать с чистого листа, напиши /reset."
     )
+
+
+@dp.message(F.text == "/reset")
+async def cmd_reset(message: Message):
+    conversation_ids.pop(message.chat.id, None)
+    await message.answer("Память диалога сброшена, начинаем с чистого листа.")
 
 
 @dp.message(F.voice)
