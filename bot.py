@@ -1,7 +1,8 @@
 """
-Бот для Render.com. Текстовые сообщения обрабатывает Dify (с моделями
-OpenRouter/Groq, настроенными внутри Dify). Голосовые — DashScope
-(Qwen3-ASR-Flash) для распознавания речи.
+Бот для Render.com (Web Service, бесплатный тариф + keep-alive).
+Параллельно с polling-ботом работает лёгкий HTTP-сервер для health-check,
+чтобы Render не "усыплял" сервис — совместно с внешним пингом (UptimeRobot).
+Текст обрабатывает Dify (OpenRouter/Groq внутри), голос — DashScope.
 """
 
 import asyncio
@@ -17,11 +18,13 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import CommandStart
 from aiogram.types import Message
+from aiohttp import web
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY")
 DIFY_API_KEY = os.environ.get("DIFY_API_KEY")
 DIFY_BASE_URL = os.environ.get("DIFY_BASE_URL", "https://api.dify.ai/v1")
+PORT = int(os.environ.get("PORT", 10000))
 
 if not BOT_TOKEN or not DASHSCOPE_API_KEY or not DIFY_API_KEY:
     raise RuntimeError(
@@ -40,7 +43,6 @@ dp = Dispatcher()
 
 
 def ask_dify(user_text: str, chat_id: int) -> str:
-    """Отправляет сообщение в Dify (там уже настроены OpenRouter/Groq)."""
     payload = json.dumps(
         {
             "inputs": {},
@@ -70,7 +72,6 @@ def ask_dify(user_text: str, chat_id: int) -> str:
 
 
 def transcribe_audio(file_bytes: bytes, filename: str) -> str:
-    """Распознаёт речь через Qwen3-ASR-Flash (DashScope)."""
     mime_type = mimetypes.guess_type(filename)[0] or "audio/ogg"
     base64_str = base64.b64encode(file_bytes).decode("utf-8")
     data_uri = f"data:{mime_type};base64,{base64_str}"
@@ -146,7 +147,23 @@ async def handle_other(message: Message):
     await message.answer("Пока умею обрабатывать только текст и голосовые.")
 
 
-async def main():
+async def health_check(request):
+    """Endpoint для проверки живости сервиса — сюда будет стучаться UptimeRobot."""
+    return web.Response(text="Bot is alive")
+
+
+async def start_web_server():
+    """Лёгкий HTTP-сервер, чтобы Render считал сервис 'веб-сервисом'."""
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logging.info(f"HTTP-сервер для health-check запущен на порту {PORT}")
+
+
+async def run_bot():
     attempt = 0
     while True:
         try:
@@ -160,6 +177,11 @@ async def main():
             wait = min(30, 5 * attempt)
             logging.warning(f"Сбой соединения: {e}. Повтор через {wait} сек...")
             await asyncio.sleep(wait)
+
+
+async def main():
+    await start_web_server()
+    await run_bot()
 
 
 if __name__ == "__main__":
