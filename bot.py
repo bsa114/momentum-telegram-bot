@@ -14,6 +14,8 @@ import os
 import urllib.error
 import urllib.request
 
+import fitz  # PyMuPDF
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import CommandStart
@@ -169,12 +171,48 @@ def extract_text_from_image(file_bytes: bytes, filename: str) -> str:
         return f"[Ошибка распознавания текста: {e}]"
 
 
+def extract_text_from_pdf(file_bytes: bytes, max_pages: int = 30) -> str:
+    """Рендерит каждую страницу PDF (в т.ч. отсканированного, без текстового слоя)
+    в изображение и прогоняет через ту же OCR-модель, что и обычные фото."""
+    try:
+        pdf = fitz.open(stream=file_bytes, filetype="pdf")
+    except Exception as e:
+        return f"[Ошибка чтения PDF: {e}]"
+
+    total_pages = pdf.page_count
+    if total_pages == 0:
+        return "[В этом PDF нет страниц]"
+
+    pages_to_process = min(total_pages, max_pages)
+    recognized_pages = []
+
+    for page_index in range(pages_to_process):
+        page = pdf.load_page(page_index)
+        # zoom ~2x повышает разрешение картинки — так текст распознаётся точнее
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        image_bytes = pixmap.tobytes("png")
+
+        page_text = extract_text_from_image(image_bytes, "page.png")
+        if page_text.startswith("[Ошибка"):
+            recognized_pages.append(f"--- Страница {page_index + 1} ---\n{page_text}")
+        else:
+            recognized_pages.append(f"--- Страница {page_index + 1} ---\n{page_text}")
+
+    pdf.close()
+
+    result = "\n\n".join(recognized_pages)
+    if total_pages > max_pages:
+        result += f"\n\n[Обработаны первые {max_pages} страниц из {total_pages}]"
+
+    return result
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     conversation_ids.pop(message.chat.id, None)
     await message.answer(
         "Привет! Я на связи, работаю быстро и понимаю текст и голосовые. "
-        "Также умею распознавать текст с фото — просто пришли картинку. "
+        "Также умею распознавать текст с фото и отсканированных PDF — просто пришли файл. "
         "Помню контекст нашего разговора — если захочешь начать с чистого листа, напиши /reset."
     )
 
@@ -230,6 +268,32 @@ async def handle_photo(message: Message):
     txt_bytes = recognized_text.encode("utf-8")
     document = BufferedInputFile(txt_bytes, filename="распознанный_текст.txt")
     await message.answer_document(document, caption="Готово! Вот распознанный текст.")
+
+
+@dp.message(F.document)
+async def handle_document(message: Message):
+    file_name = message.document.file_name or ""
+    mime_type = message.document.mime_type or ""
+
+    if not (file_name.lower().endswith(".pdf") or mime_type == "application/pdf"):
+        await message.answer("Пока умею распознавать текст только из PDF-файлов.")
+        return
+
+    await message.answer("Распознаю текст в PDF, это может занять немного времени...")
+    file = await bot.get_file(message.document.file_id)
+    file_bytes_io = await bot.download_file(file.file_path)
+    file_bytes = file_bytes_io.read()
+
+    loop = asyncio.get_event_loop()
+    recognized_text = await loop.run_in_executor(None, extract_text_from_pdf, file_bytes)
+
+    if recognized_text.startswith("[Ошибка"):
+        await message.answer(recognized_text)
+        return
+
+    txt_bytes = recognized_text.encode("utf-8")
+    document = BufferedInputFile(txt_bytes, filename="распознанный_текст.txt")
+    await message.answer_document(document, caption="Готово! Вот распознанный текст из PDF.")
 
 
 @dp.message(F.text)
