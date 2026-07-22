@@ -71,7 +71,7 @@ class InspectorFillError(Exception):
 
 
 def _call_claude_via_openrouter(
-    system_prompt: str, user_message: str, api_key: str, max_tokens: int = 8000
+    system_prompt: str, user_message: str, api_key: str, max_tokens: int = 32000
 ) -> str:
     """Вызывает Claude через OpenRouter — формат OpenAI chat completions,
     не нативный Anthropic Messages API (у OpenRouter system идёт как
@@ -80,6 +80,7 @@ def _call_claude_via_openrouter(
         {
             "model": OPENROUTER_MODEL,
             "max_tokens": max_tokens,
+            "reasoning": {"enabled": False},
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
@@ -96,12 +97,27 @@ def _call_claude_via_openrouter(
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as response:
+        with urllib.request.urlopen(req, timeout=180) as response:
             result = json.loads(response.read().decode("utf-8"))
         choices = result.get("choices", [])
         if not choices:
-            raise InspectorFillError(f"Пустой ответ от OpenRouter: {result}")
-        return choices[0]["message"]["content"]
+            raise InspectorFillError(f"Пустой ответ от OpenRouter (нет choices): {result}")
+
+        message = choices[0].get("message", {})
+        content = message.get("content")
+        finish_reason = choices[0].get("finish_reason")
+
+        if not content:
+            # content пустой или None — часто означает, что ответ обрезан по лимиту
+            # токенов (finish_reason == "length"), либо модель ушла в reasoning
+            # и не успела написать финальный текст.
+            raise InspectorFillError(
+                f"OpenRouter вернул пустой content (finish_reason={finish_reason}). "
+                f"Вероятно, не хватило max_tokens для такого большого ответа. "
+                f"Полный ответ: {json.dumps(result, ensure_ascii=False)[:500]}"
+            )
+
+        return content
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise InspectorFillError(f"Ошибка OpenRouter ({e.code}): {body[:300]}")
