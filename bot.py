@@ -325,18 +325,44 @@ async def _inspector_process_audio_bytes(
 
     state["stage"] = "awaiting_answers"
 
-    lines = [
+    intro_line = (
         f"Заполнил {filled_count} пункт(ов) сам. Осталось уточнить {len(questions)} — отвечай одним "
-        f"сообщением, номерами вариантов через запятую (например: 1-3, 2-1, 3-4).\n"
-    ]
-    for index, q in enumerate(questions, start=1):
-        lines.append(f"\n{index}. [{q.get('section', '')}] {q.get('topic', '')}")
-        if q.get("context"):
-            lines.append(f"   Из расшифровки: {q['context']}")
-        for option in q.get("options", []):
-            lines.append(f"   {option['label']}) {option.get('comment', '')}")
+        f"сообщением, номерами вариантов через запятую (например: 1-3, 2-1, 3-4)."
+    )
 
-    await message.answer("\n".join(lines))
+    question_blocks = []
+    for index, q in enumerate(questions, start=1):
+        block_lines = [f"\n{index}. [{q.get('section', '')}] {q.get('topic', '')}"]
+        if q.get("context"):
+            block_lines.append(f"   Из расшифровки: {q['context']}")
+        for option in q.get("options", []):
+            block_lines.append(f"   {option['label']}) {option.get('comment', '')}")
+        question_blocks.append("\n".join(block_lines))
+
+    await _send_in_chunks(message, intro_line, question_blocks)
+
+
+TELEGRAM_MESSAGE_SAFE_LIMIT = 3500
+
+
+async def _send_in_chunks(message: Message, intro_line: str, blocks: list[str]) -> None:
+    """Отправляет список текстовых блоков одним или несколькими сообщениями,
+    не превышая безопасный лимит длины сообщения в Telegram (реальный лимит
+    4096 символов, берём с запасом)."""
+    current_chunk = intro_line
+    is_first_chunk = True
+
+    for block in blocks:
+        candidate = current_chunk + "\n" + block
+        if len(candidate) > TELEGRAM_MESSAGE_SAFE_LIMIT:
+            await message.answer(current_chunk)
+            current_chunk = block
+            is_first_chunk = False
+        else:
+            current_chunk = candidate
+
+    if current_chunk:
+        await message.answer(current_chunk)
 
 
 async def _inspector_finalize_and_send(message: Message, chat_id: int) -> None:
