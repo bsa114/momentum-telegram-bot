@@ -38,9 +38,9 @@ from aiogram.types import BufferedInputFile, Message
 from aiohttp import web
 
 from inspector_fill import InspectorFillError, analyze_transcript_and_fill, resolve_questions_answers
-from inspector_transcription import TranscriptionError, transcribe_long_audio
+from groq_transcription import GroqTranscriptionError, build_plain_transcript, transcribe_audio_bytes
+from speaker_diarization import DiarizationError, diarize_transcript
 from link_download import LinkDownloadError, download_file_from_link
-from temp_file_server import periodic_cleanup_task, pop_file_from_memory, serve_temp_file, store_file_in_memory
 from xlsx_writer import apply_fill_results, check_for_formula_errors
 
 # --- Переменные окружения ---
@@ -50,7 +50,7 @@ DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY")
 DIFY_API_KEY = os.environ.get("DIFY_API_KEY")
 DIFY_BASE_URL = os.environ.get("DIFY_BASE_URL", "https://api.dify.ai/v1")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL")  # напр. https://momentum-telegram-bot.onrender.com
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 PORT = int(os.environ.get("PORT", 10000))
 
 if not BOT_TOKEN or not DASHSCOPE_API_KEY or not DIFY_API_KEY:
@@ -58,10 +58,10 @@ if not BOT_TOKEN or not DASHSCOPE_API_KEY or not DIFY_API_KEY:
         "Не заданы TELEGRAM_BOT_TOKEN, DASHSCOPE_API_KEY и/или DIFY_API_KEY"
     )
 
-if not OPENROUTER_API_KEY or not PUBLIC_BASE_URL:
+if not OPENROUTER_API_KEY or not GROQ_API_KEY:
     raise RuntimeError(
-        "Не заданы OPENROUTER_API_KEY и/или PUBLIC_BASE_URL — они нужны для режима Инспектора "
-        "(заполнение xlsx-анкет по аудио визита)"
+        "Не заданы OPENROUTER_API_KEY и/или GROQ_API_KEY — они нужны для режима Инспектора "
+        "(транскрибация через Groq Whisper, заполнение xlsx-анкет через Claude/OpenRouter)"
     )
 
 DASHSCOPE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
@@ -274,24 +274,37 @@ async def _inspector_process_audio_bytes(
     message: Message, chat_id: int, state: dict, file_bytes: bytes, content_type: str
 ) -> None:
     """Общая логика после того, как байты аудио визита уже получены —
-    не важно, напрямую из Telegram или скачаны по ссылке."""
-    file_id = store_file_in_memory(file_bytes, content_type)
-    public_url = f"{PUBLIC_BASE_URL}/tmp-audio/{file_id}"
-
+    не важно, напрямую из Telegram или скачаны по ссылке. Транскрибация
+    через Groq Whisper (лучше справляется с шумом и фоновой музыкой, чем
+    DashScope), диаризация — отдельным проходом через Claude/OpenRouter,
+    так как у Groq Whisper нет встроенного разделения по говорящим."""
     loop = asyncio.get_event_loop()
+
     try:
-        transcript_text = await loop.run_in_executor(
-            None, transcribe_long_audio, public_url, DASHSCOPE_API_KEY
+        groq_result = await loop.run_in_executor(
+            None, transcribe_audio_bytes, file_bytes, "audio.m4a", GROQ_API_KEY
         )
-    except TranscriptionError as e:
+    except GroqTranscriptionError as e:
         await message.answer(f"Не получилось распознать аудио: {e}")
         return
-    finally:
-        pop_file_from_memory(file_id)
 
-    if not transcript_text.strip():
+    plain_transcript = build_plain_transcript(groq_result)
+    if not plain_transcript.strip():
         await message.answer("Не удалось получить текст из аудио — расшифровка пустая.")
         return
+
+    await message.answer("Распознал текст, теперь размечаю по говорящим...")
+
+    try:
+        transcript_text = await loop.run_in_executor(
+            None, diarize_transcript, plain_transcript, OPENROUTER_API_KEY
+        )
+    except DiarizationError as e:
+        await message.answer(
+            f"Не получилось разметить расшифровку по говорящим ({e}), "
+            f"использую текст без разметки ролей."
+        )
+        transcript_text = plain_transcript
 
     state["transcript_text"] = transcript_text
 
@@ -671,10 +684,9 @@ async def health_check(request):
 
 
 async def start_web_server():
-    """Лёгкий HTTP-сервер: health-check + временная раздача аудио для DashScope."""
+    """Лёгкий HTTP-сервер для health-check (keep-alive через cron-job.org)."""
     app = web.Application()
     app.router.add_get("/", health_check)
-    app.router.add_get("/tmp-audio/{file_id}", serve_temp_file)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -700,7 +712,6 @@ async def run_bot():
 
 async def main():
     await start_web_server()
-    asyncio.create_task(periodic_cleanup_task())
     await run_bot()
 
 
