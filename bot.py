@@ -37,8 +37,14 @@ from aiogram.filters import CommandStart
 from aiogram.types import BufferedInputFile, Message
 from aiohttp import web
 
-from inspector_fill import InspectorFillError, analyze_transcript_and_fill, resolve_questions_answers
-from groq_transcription import GroqTranscriptionError, build_plain_transcript, transcribe_audio_bytes
+from inspector_fill import (
+    InspectorFillError,
+    analyze_transcript_and_fill,
+    parse_free_text_answers,
+    resolve_free_text_answers,
+    resolve_questions_answers,
+)
+from groq_transcription import GroqTranscriptionError, transcribe_with_chunking
 from speaker_diarization import DiarizationError, diarize_transcript
 from link_download import LinkDownloadError, download_file_from_link
 from xlsx_writer import apply_fill_results, check_for_formula_errors
@@ -256,17 +262,27 @@ def extract_text_from_pdf(file_bytes: bytes, max_pages: int = 30) -> str:
 
 
 def _parse_answers(text: str) -> dict[int, str]:
-    """Разбирает ответ вида '1-3, 2-1, 3-4' в {1: '3', 2: '1', 3: '4'}."""
-    result = {}
-    parts = [p.strip() for p in text.replace(";", ",").split(",")]
-    for part in parts:
-        if "-" not in part:
-            continue
-        question_num, label = part.split("-", 1)
-        question_num = question_num.strip()
-        label = label.strip()
-        if question_num.isdigit():
-            result[int(question_num)] = label
+    """Разбирает структурированный ответ вида '1-3, 2-1, 3-4' или '1.2.3.4'
+    или '1:3 2:1 3:4' и т.п. в {1: '3', 2: '1', 3: '4'}. Понимает разные
+    разделители между номером вопроса и вариантом (-, :, .) и между парами
+    (запятая, точка с запятой, пробел, перенос строки). Если ничего не
+    удалось разобрать — возвращает пустой словарь, и вызывающий код должен
+    попробовать LLM-фолбэк (см. _parse_answers_via_llm)."""
+    import re
+
+    result: dict[int, str] = {}
+
+    # Нормализуем разделители между парами в запятую
+    normalized = text.replace(";", ",").replace("\n", ",")
+
+    # Паттерн вида "1-3" / "1:3" / "1.3" / "1 3" — номер вопроса, разделитель, вариант
+    pattern = re.compile(r"(\d+)\s*[-:.\s]\s*(\d+)")
+
+    for match in pattern.finditer(normalized):
+        question_num = int(match.group(1))
+        label = match.group(2)
+        result[question_num] = label
+
     return result
 
 
@@ -276,19 +292,28 @@ async def _inspector_process_audio_bytes(
     """Общая логика после того, как байты аудио визита уже получены —
     не важно, напрямую из Telegram или скачаны по ссылке. Транскрибация
     через Groq Whisper (лучше справляется с шумом и фоновой музыкой, чем
-    DashScope), диаризация — отдельным проходом через Claude/OpenRouter,
-    так как у Groq Whisper нет встроенного разделения по говорящим."""
+    DashScope), с автоматическим разбиением на части для файлов больше
+    25 МБ (лимит Groq). Диаризация — отдельным проходом через
+    Claude/OpenRouter, так как у Groq Whisper нет встроенного разделения
+    по говорящим."""
     loop = asyncio.get_event_loop()
 
-    try:
-        groq_result = await loop.run_in_executor(
-            None, transcribe_audio_bytes, file_bytes, "audio.m4a", GROQ_API_KEY
+    from audio_chunking import AudioChunkingError, needs_chunking
+
+    if needs_chunking(file_bytes):
+        await message.answer(
+            "Файл довольно большой — сначала разобью его на части, потом распознаю "
+            "каждую по отдельности. Это может занять несколько минут..."
         )
-    except GroqTranscriptionError as e:
+
+    try:
+        plain_transcript = await loop.run_in_executor(
+            None, transcribe_with_chunking, file_bytes, "audio.m4a", GROQ_API_KEY
+        )
+    except (GroqTranscriptionError, AudioChunkingError) as e:
         await message.answer(f"Не получилось распознать аудио: {e}")
         return
 
-    plain_transcript = build_plain_transcript(groq_result)
     if not plain_transcript.strip():
         await message.answer("Не удалось получить текст из аудио — расшифровка пустая.")
         return
@@ -312,6 +337,18 @@ async def _inspector_process_audio_bytes(
     document = BufferedInputFile(txt_bytes, filename="расшифровка.txt")
     await message.answer_document(document, caption="Расшифровка готова.")
 
+    await _inspector_analyze_and_fill(message, chat_id, state, transcript_text)
+
+
+async def _inspector_analyze_and_fill(
+    message: Message, chat_id: int, state: dict, transcript_text: str
+) -> None:
+    """Общая логика анализа уже готового текста расшифровки (не важно,
+    получен ли он через Groq+диаризацию из аудио, или прислан пользователем
+    напрямую как готовая транскрипция) — заполнение анкеты и формирование
+    уточняющих вопросов."""
+    loop = asyncio.get_event_loop()
+
     await message.answer("Разбираю расшифровку и заполняю анкету, подожди немного...")
 
     try:
@@ -329,7 +366,34 @@ async def _inspector_process_audio_bytes(
 
     state["fill_result"] = fill_result
 
-    questions = fill_result.get("questions", [])
+    MAX_QUESTIONS = 10
+    all_questions = fill_result.get("questions", [])
+
+    if len(all_questions) > MAX_QUESTIONS:
+        # Модель не уложилась в лимит несмотря на инструкцию — обрезаем
+        # принудительно. Вопросы сверх лимита не выбрасываем совсем: берём
+        # для каждого первый вариант ответа (обычно это самый нейтральный/
+        # позитивный по умолчанию) и сразу добавляем в filled, чтобы данные
+        # не терялись молча.
+        questions = all_questions[:MAX_QUESTIONS]
+        overflow_questions = all_questions[MAX_QUESTIONS:]
+
+        for q in overflow_questions:
+            options = q.get("options", [])
+            if options:
+                first_option = options[0]
+                fill_result["filled"].append(
+                    {
+                        "row": first_option["row"],
+                        "score": first_option["score"],
+                        "comment": first_option.get("comment", ""),
+                    }
+                )
+
+        fill_result["questions"] = questions  # держим fill_result в синхроне с урезанным списком
+    else:
+        questions = all_questions
+
     filled_count = len(fill_result.get("filled", []))
 
     if not questions:
@@ -340,7 +404,8 @@ async def _inspector_process_audio_bytes(
 
     intro_line = (
         f"Заполнил {filled_count} пункт(ов) сам. Осталось уточнить {len(questions)} — отвечай одним "
-        f"сообщением, номерами вариантов через запятую (например: 1-3, 2-1, 3-4)."
+        f"сообщением. Можно номерами вариантов (например: 1-3, 2-1, 3-4), можно по пунктам "
+        f"(1. 2. 3.), а можно и просто свободным текстом — постараюсь понять."
     )
 
     question_blocks = []
@@ -542,6 +607,7 @@ async def handle_document(message: Message):
     mime_type = message.document.mime_type or ""
     is_xlsx = file_name.lower().endswith(".xlsx")
     is_pdf = file_name.lower().endswith(".pdf") or mime_type == "application/pdf"
+    is_txt = file_name.lower().endswith(".txt") or mime_type == "text/plain"
 
     # --- xlsx всегда запускает/продолжает режим Инспектора ---
     if is_xlsx:
@@ -560,14 +626,40 @@ async def handle_document(message: Message):
             "• Файл до 20 МБ — как обычное аудио/голосовое.\n"
             "• Файл больше 20 МБ — загрузи на Яндекс.Диск или Google Drive, сделай "
             "публичную ссылку и пришли её текстом (можно сразу, без попытки прислать файл).\n\n"
+            "Также можно вместо аудио сразу прислать готовую транскрипцию — файлом (.txt) "
+            "или текстом прямо в чат, если она уже есть.\n\n"
             "Напиши /reset, если хочешь выйти из этого режима."
         )
+        return
+
+    # --- .txt в режиме Инспектора (ожидание аудио) — считаем готовой транскрипцией ---
+    if is_txt and _in_inspector_mode(chat_id):
+        state = inspector_states[chat_id]
+        if state.get("stage") != "awaiting_audio":
+            await message.answer(
+                "Сейчас жду ответы на уточняющие вопросы, а не новый файл. "
+                "Если хочешь начать визит заново, напиши /reset."
+            )
+            return
+
+        file = await bot.get_file(message.document.file_id)
+        file_bytes_io = await bot.download_file(file.file_path)
+        transcript_text = file_bytes_io.read().decode("utf-8", errors="replace")
+
+        if not transcript_text.strip():
+            await message.answer("Файл с транскрипцией оказался пустым.")
+            return
+
+        await message.answer("Готовая транскрипция получена, использую её напрямую.")
+        state["transcript_text"] = transcript_text
+        await _inspector_analyze_and_fill(message, chat_id, state, transcript_text)
         return
 
     # --- В режиме Инспектора документ — это либо не то (PDF/др.), либо ошибка ---
     if _in_inspector_mode(chat_id):
         await message.answer(
-            "Сейчас в режиме Инспектора жду xlsx-анкету или аудио визита, а не этот файл. "
+            "Сейчас в режиме Инспектора жду xlsx-анкету, аудио визита или готовую "
+            "транскрипцию (.txt), а не этот файл. "
             "Напиши /reset, если хочешь выйти из режима Инспектора и вернуться к обычной работе."
         )
         return
@@ -640,6 +732,25 @@ async def handle_text(message: Message):
     # --- Режим Инспектора: ответы на уточняющие вопросы ---
     if _in_inspector_mode(chat_id):
         state = inspector_states[chat_id]
+
+        if state.get("stage") == "awaiting_audio":
+            # Ждём аудио или ссылку, но пришёл обычный текст — скорее всего,
+            # это готовая транскрипция визита, присланная напрямую (без файла).
+            # Отличаем от короткой случайной реплики по длине: настоящая
+            # расшифровка 60-90-минутного визита обычно заметно длиннее.
+            if len(message.text.strip()) < 200:
+                await message.answer(
+                    "Сейчас жду xlsx-анкету, аудио визита или готовую транскрипцию "
+                    "(файлом .txt или текстом). Если это была попытка прислать "
+                    "транскрипцию — пришли текст целиком, он выглядит коротковато."
+                )
+                return
+
+            await message.answer("Похоже на готовую транскрипцию, использую её напрямую.")
+            state["transcript_text"] = message.text
+            await _inspector_analyze_and_fill(message, chat_id, state, message.text)
+            return
+
         if state.get("stage") != "awaiting_answers":
             await message.answer(
                 "В режиме Инспектора сейчас жду xlsx-анкету или аудио визита, а не текст. "
@@ -647,15 +758,36 @@ async def handle_text(message: Message):
             )
             return
 
+        questions = state["fill_result"].get("questions", [])
         user_answers = _parse_answers(message.text)
-        if not user_answers:
-            await message.answer(
-                "Не разобрал ответ. Формат: номер_вопроса-вариант, через запятую, "
-                "например: 1-3, 2-1, 3-4"
-            )
-            return
 
-        resolved_rows = resolve_questions_answers(state["fill_result"], user_answers)
+        # Быстрый regex сработал и покрыл все вопросы — используем его, не тратя лишний вызов модели
+        if user_answers and len(user_answers) >= len(questions):
+            resolved_rows = resolve_questions_answers(state["fill_result"], user_answers)
+        else:
+            # Regex не справился (свободный текст, ответ не по порядку, развёрнутые
+            # комментарии своими словами) — отдаём разбор LLM.
+            await message.answer("Разбираю ответ, подожди немного...")
+            loop = asyncio.get_event_loop()
+            try:
+                parsed_answers = await loop.run_in_executor(
+                    None, parse_free_text_answers, questions, message.text, OPENROUTER_API_KEY
+                )
+            except InspectorFillError as e:
+                await message.answer(
+                    f"Не получилось разобрать ответ ({e}). Попробуй переформулировать, "
+                    f"например номерами вида 1-3, 2-1, 3-4, или обычным текстом по порядку вопросов."
+                )
+                return
+
+            if not parsed_answers:
+                await message.answer(
+                    "Не удалось сопоставить ответ ни с одним вопросом. Попробуй переформулировать."
+                )
+                return
+
+            resolved_rows = resolve_free_text_answers(state["fill_result"], parsed_answers)
+
         state["fill_result"]["filled"].extend(resolved_rows)
 
         await message.answer("Принято. Собираю финальный файл...")
