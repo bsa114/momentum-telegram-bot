@@ -375,7 +375,7 @@ async def _inspector_finalize_and_send(message: Message, chat_id: int) -> None:
     output_path = f"/tmp/inspector_output_{chat_id}.xlsx"
 
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(
+    skipped_rows = await loop.run_in_executor(
         None,
         apply_fill_results,
         template_path,
@@ -391,7 +391,13 @@ async def _inspector_finalize_and_send(message: Message, chat_id: int) -> None:
 
     document = BufferedInputFile(output_bytes, filename="заполненная_анкета.xlsx")
 
-    caption_lines = [f"Готово! Заполнено пунктов: {len(fill_result.get('filled', []))}."]
+    actually_filled = len(fill_result.get("filled", [])) - len(skipped_rows)
+    caption_lines = [f"Готово! Заполнено пунктов: {actually_filled}."]
+    if skipped_rows:
+        caption_lines.append(
+            f"⚠️ Пропущено {len(skipped_rows)} строк без комментария (не записаны, чтобы "
+            f"не оставлять балл без пояснения): {', '.join(str(r) for r in skipped_rows)}"
+        )
     if problems:
         caption_lines.append(f"⚠️ Обнаружены проблемы с формулами: {', '.join(problems)}")
 

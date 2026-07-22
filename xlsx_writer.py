@@ -44,9 +44,12 @@ def apply_fill_results(
     output_path: str,
     header: dict,
     filled_rows: list[dict],
-) -> None:
+) -> list[int]:
     """Открывает пустой шаблон, проставляет баллы/комментарии/шапку,
-    сохраняет как новый файл (не трогая исходный)."""
+    сохраняет как новый файл (не трогая исходный).
+
+    Возвращает список номеров строк, которые были пропущены из-за
+    отсутствия комментария (защита от 'осиротевших' баллов без пояснения)."""
     wb = openpyxl.load_workbook(empty_template_path, data_only=False)
     ws = wb["шаблон"]
 
@@ -67,14 +70,25 @@ def apply_fill_results(
         else:
             cell.value = f"{existing_text} {value}".strip()
 
+    skipped_rows = []
     for item in filled_rows:
         row = item["row"]
         score = item["score"]
-        comment = item.get("comment", "")
+        comment = item.get("comment", "").strip()
+
+        if not comment:
+            # Без комментария балл не записываем вообще — оставляем строку
+            # пустой, а не создаём "осиротевший" балл без пояснения. Это
+            # частая ошибка модели: она иногда заполняет две строки одного
+            # вопроса, и одна из них остаётся без текста.
+            skipped_rows.append(row)
+            continue
+
         ws.cell(row=row, column=SCORE_COLUMN, value=score)
         ws.cell(row=row, column=COMMENT_COLUMN, value=comment)
 
     wb.save(output_path)
+    return skipped_rows
 
 
 def check_for_formula_errors(output_path: str) -> list[str]:
