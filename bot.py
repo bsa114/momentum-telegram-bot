@@ -28,6 +28,7 @@ import mimetypes
 import os
 import urllib.error
 import urllib.request
+from datetime import datetime
 
 import fitz  # PyMuPDF
 
@@ -96,6 +97,13 @@ def _in_inspector_mode(chat_id: int) -> bool:
 
 def _reset_inspector_state(chat_id: int) -> None:
     inspector_states.pop(chat_id, None)
+
+
+def _timestamp_for_filename() -> str:
+    """Возвращает текущее время в формате ГГГГММДД_ЧЧММСС для имён файлов —
+    чтобы расшифровки и заполненные анкеты не перезаписывали друг друга
+    у пользователя при повторных визитах в один день."""
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 # ============================================================
@@ -334,7 +342,7 @@ async def _inspector_process_audio_bytes(
     state["transcript_text"] = transcript_text
 
     txt_bytes = transcript_text.encode("utf-8")
-    document = BufferedInputFile(txt_bytes, filename="расшифровка.txt")
+    document = BufferedInputFile(txt_bytes, filename=f"расшифровка_{_timestamp_for_filename()}.txt")
     await message.answer_document(document, caption="Расшифровка готова.")
 
     await _inspector_analyze_and_fill(message, chat_id, state, transcript_text)
@@ -382,11 +390,15 @@ async def _inspector_analyze_and_fill(
             options = q.get("options", [])
             if options:
                 first_option = options[0]
+                comment = first_option.get("comment") or (
+                    "Пункт закрыт автоматически по умолчанию (превышен лимит уточняющих "
+                    "вопросов в одном визите) — стоит перепроверить вручную."
+                )
                 fill_result["filled"].append(
                     {
                         "row": first_option["row"],
                         "score": first_option["score"],
-                        "comment": first_option.get("comment", ""),
+                        "comment": comment,
                     }
                 )
 
@@ -467,7 +479,7 @@ async def _inspector_finalize_and_send(message: Message, chat_id: int) -> None:
     with open(output_path, "rb") as f:
         output_bytes = f.read()
 
-    document = BufferedInputFile(output_bytes, filename="заполненная_анкета.xlsx")
+    document = BufferedInputFile(output_bytes, filename=f"заполненная_анкета_{_timestamp_for_filename()}.xlsx")
 
     actually_filled = len(fill_result.get("filled", [])) - len(skipped_rows)
     caption_lines = [f"Готово! Заполнено пунктов: {actually_filled}."]
